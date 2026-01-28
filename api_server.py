@@ -1,6 +1,6 @@
 """
 Multi-Municipality Water Consumption Forecasting API
-Flask API server for water consumption predictions
+Flask API server for water consumption predictions - Railway Deployment Ready
 """
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
@@ -15,7 +15,17 @@ import os
 
 # Initialize Flask app
 app = Flask(__name__, static_folder=os.path.dirname(os.path.abspath(__file__)))
-CORS(app)
+
+# ============================================================
+# RAILWAY DEPLOYMENT FIX - CORS Configuration
+# ============================================================
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",  # In production, specify your Railway domain
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -63,7 +73,8 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'model_loaded': model is not None,
-        'data_loaded': df is not None
+        'data_loaded': df is not None,
+        'environment': 'production' if os.getenv('RAILWAY_ENVIRONMENT') else 'development'
     }), 200
 
 @app.route('/api/municipalities', methods=['GET'])
@@ -198,16 +209,26 @@ def compare_municipalities():
     if model is None or municipality_encoder is None or feature_columns is None:
         return jsonify({'error': 'Model not loaded'}), 500
     
-    municipalities = df['region_name'].unique()
-    comparison_data = []
-    
-    for muni in sorted(municipalities):
-        try:
-            muni_data = df[df['region_name'] == muni]
-            avg_consumption = muni_data['water_consumption_liters'].mean() / 1_000_000
+    try:
+        municipalities = sorted(df['region_name'].unique())
+        comparison_data = []
+        
+        # Standard conditions for comparison
+        temperature = 32
+        humidity = 65
+        rainfall = 0
+        
+        for municipality in municipalities:
+            muni_data = df[df['region_name'] == municipality].sort_values('date').tail(30)
+            
+            if len(muni_data) == 0:
+                continue
             
             # Encode municipality
-            municipality_code = municipality_encoder.transform([muni])[0]
+            try:
+                municipality_code = municipality_encoder.transform([municipality])[0]
+            except:
+                continue
             
             # Get municipality characteristics
             population = int(muni_data['population'].mean())
@@ -216,15 +237,19 @@ def compare_municipalities():
             
             # Create normalized versions
             prev_day_normalized = prev_day_avg / 100_000_000
-            season_str = muni_data['season'].iloc[0]
+            
+            # Get month and season
+            latest_date = pd.to_datetime(muni_data['date'].iloc[-1])
+            month = latest_date.month
             season_map = {'Winter': 0, 'Summer': 1, 'Monsoon': 2, 'Spring': 3}
+            season_str = muni_data['season'].iloc[-1]
             season = season_map.get(season_str, 0)
             
-            # Create feature vector for prediction (NEW FEATURES)
+            # Create feature vector
             feature_dict = {
-                'temperature_celsius': 32,
-                'humidity_percent': 65,
-                'rainfall_mm': 0,
+                'temperature_celsius': temperature,
+                'humidity_percent': humidity,
+                'rainfall_mm': rainfall,
                 'is_weekend': 0,
                 'is_holiday': 0,
                 'municipality_encoded': municipality_code,
@@ -233,56 +258,51 @@ def compare_municipalities():
                 'prev_day_consumption_normalized': prev_day_normalized,
                 'prev_7day_avg_normalized': prev_day_normalized,
                 'consumption_variance': 1.0,
-                'month': 1,
+                'month': month,
                 'season': season
             }
             
-            # Create DataFrame with correct column order
+            # Predict
             X_pred = pd.DataFrame([feature_dict])[feature_columns]
-            
-            # Make prediction using trained model
             predicted_liters = model.predict(X_pred)[0]
             predicted_ml = predicted_liters / 1_000_000
             
             comparison_data.append({
-                'municipality': muni,
+                'municipality': municipality,
                 'predicted_ml': float(round(predicted_ml, 2)),
                 'population': population,
-                'avg_consumption': float(round(avg_consumption, 2))
+                'industrial_index': industrial_index
             })
-        except Exception as e:
-            logger.error(f"Error predicting for {muni}: {e}")
-            # Fallback to average
-            muni_data = df[df['region_name'] == muni]
-            avg_consumption = muni_data['water_consumption_liters'].mean() / 1_000_000
-            population = int(muni_data['population'].iloc[0]) if 'population' in muni_data.columns else 100000
-            
-            comparison_data.append({
-                'municipality': muni,
-                'predicted_ml': float(round(avg_consumption, 2)),
-                'population': population,
-                'avg_consumption': float(round(avg_consumption, 2))
-            })
+        
+        return jsonify({
+            'comparison': comparison_data,
+            'conditions': {
+                'temperature': temperature,
+                'humidity': humidity,
+                'rainfall': rainfall
+            }
+        }), 200
     
-    return jsonify({'municipalities': comparison_data}), 200
+    except Exception as e:
+        logger.error(f"Comparison error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/forecast', methods=['POST'])
 def forecast():
-    """Get 7-day forecast using trained Random Forest model"""
-    if model is None:
+    """Generate 7-day forecast using trained model"""
+    if df is None:
+        return jsonify({'error': 'Data not loaded'}), 500
+    if model is None or municipality_encoder is None or feature_columns is None:
         return jsonify({'error': 'Model not loaded'}), 500
-    if municipality_encoder is None or feature_columns is None:
-        return jsonify({'error': 'Model components not loaded'}), 500
     
     try:
         data = request.json
         municipality = data.get('municipality')
-        weather_forecast = data.get('weather_forecast', [])
         
         if not municipality:
             return jsonify({'error': 'Municipality required'}), 400
         
-        # Get recent data for the municipality
+        # Get recent data
         muni_data = df[df['region_name'] == municipality].sort_values('date').tail(30)
         
         if len(muni_data) == 0:
@@ -298,42 +318,33 @@ def forecast():
         population = int(muni_data['population'].mean())
         industrial_index = int(muni_data['industrial_activity_index'].mean())
         prev_day_avg = muni_data['water_consumption_liters'].mean()
+        
         prev_day_normalized = prev_day_avg / 100_000_000
-        current_date = pd.to_datetime(muni_data['date'].iloc[-1])
         
+        latest_date = pd.to_datetime(muni_data['date'].iloc[-1])
+        month = latest_date.month
         season_map = {'Winter': 0, 'Summer': 1, 'Monsoon': 2, 'Spring': 3}
+        season_str = muni_data['season'].iloc[-1]
+        season = season_map.get(season_str, 0)
         
-        # Generate forecast for 7 days
+        # Generate 7-day forecast
         forecast_data = []
-        baseline_prediction = None  # Store first prediction as baseline
         
-        for i in range(7):
-            date = (current_date + timedelta(days=i+1)).strftime('%Y-%m-%d')
+        for i in range(1, 8):
+            forecast_date = latest_date + timedelta(days=i)
+            date = forecast_date.strftime('%Y-%m-%d')
             
-            # Use weather data if available, otherwise use defaults
-            if i < len(weather_forecast):
-                weather = weather_forecast[i]
-                temp = weather.get('temp', 30)
-                humidity = weather.get('humidity', 65)
-                rainfall = weather.get('rainfall', 0)
-            else:
-                temp = 30 + (i % 3) - 1
-                humidity = 65
-                rainfall = 0
+            # Simulate weather variations
+            temp = np.random.randint(28, 38)
+            humidity = np.random.randint(50, 85)
+            rainfall = np.random.choice([0, 0, 0, 5, 10, 15], p=[0.7, 0.1, 0.1, 0.05, 0.03, 0.02])
+            is_weekend = 1 if forecast_date.weekday() >= 5 else 0
             
-            # Determine day type (weekday or weekend)
-            forecast_date = current_date + timedelta(days=i+1)
-            is_weekend = forecast_date.weekday() >= 5
-            month = forecast_date.month
-            season_str = muni_data['season'].iloc[-1]
-            season = season_map.get(season_str, 0)
-            
-            # Create feature vector for prediction (NEW FEATURES)
             feature_dict = {
                 'temperature_celsius': temp,
                 'humidity_percent': humidity,
                 'rainfall_mm': rainfall,
-                'is_weekend': 1 if is_weekend else 0,
+                'is_weekend': is_weekend,
                 'is_holiday': 0,
                 'municipality_encoded': municipality_code,
                 'population_scaled': population / 1_000_000,
@@ -380,6 +391,37 @@ def forecast():
     
     except Exception as e:
         logger.error(f"Forecast error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/historical/<municipality>', methods=['GET'])
+def get_historical(municipality):
+    """Get historical data for a municipality"""
+    if df is None:
+        return jsonify({'error': 'Data not loaded'}), 500
+    
+    try:
+        muni_data = df[df['region_name'] == municipality].sort_values('date').tail(30)
+        
+        if len(muni_data) == 0:
+            return jsonify({'error': f'No data for municipality: {municipality}'}), 404
+        
+        historical = []
+        for _, row in muni_data.iterrows():
+            historical.append({
+                'date': str(row['date']),
+                'consumption_ml': float(row['water_consumption_liters'] / 1_000_000),
+                'temperature': float(row['temperature_celsius']),
+                'humidity': float(row['humidity_percent']),
+                'rainfall': float(row['rainfall_mm'])
+            })
+        
+        return jsonify({
+            'municipality': municipality,
+            'historical': historical
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Historical data error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/current-weather/<municipality>', methods=['GET'])
@@ -432,42 +474,7 @@ def model_info():
         'last_updated': datetime.now().isoformat()
     }), 200
 
-@app.route('/', methods=['GET'])
-def index():
-    """Serve dashboard HTML"""
-    try:
-        return send_file('dashboard_with_live_ml.html', mimetype='text/html')
-    except:
-        return jsonify({
-            'message': 'API Server Running',
-            'endpoints': {
-                '/': 'This dashboard',
-                '/api/health': 'Health check',
-                '/api/municipalities': 'List all municipalities',
-                '/api/predict': 'Make predictions (POST)',
-                '/api/statistics/<municipality>': 'Get municipality statistics',
-                '/api/historical/<municipality>': 'Get historical data',
-                '/api/model-info': 'Model information'
-            }
-        }), 200
-
-@app.route('/water_distribution', methods=['GET'])
-def water_distribution():
-    """Serve water distribution visualization page"""
-    try:
-        return send_file('water_distribution.html', mimetype='text/html')
-    except Exception as e:
-        return jsonify({'error': f'Could not load water distribution page: {str(e)}'}), 404
-
-@app.route('/apwrims', methods=['GET'])
-def apwrims():
-    """Serve APWRIMS page"""
-    try:
-        return send_file('apwrims_optimized_final.html', mimetype='text/html')
-    except Exception as e:
-        return jsonify({'error': f'Could not load APWRIMS page: {str(e)}'}), 404
-
-# ========== STATIC FILE SERVING (BEFORE ERROR HANDLERS) ==========
+# ========== STATIC FILE SERVING ==========
 
 @app.route('/')
 def serve_index():
@@ -475,7 +482,8 @@ def serve_index():
     try:
         return send_from_directory(os.path.dirname(os.path.abspath(__file__)), 'dashboard_with_live_ml.html')
     except Exception as e:
-        return jsonify({'error': 'Dashboard not found'}), 404
+        logger.error(f"Error serving dashboard: {e}")
+        return jsonify({'error': 'Dashboard not found', 'details': str(e)}), 404
 
 @app.route('/dashboard_with_live_ml.html')
 def serve_dashboard():
@@ -526,11 +534,15 @@ def internal_error(error):
 # ========== MAIN ==========
 
 if __name__ == '__main__':
+    # Get port from environment variable (Railway provides this)
+    port = int(os.environ.get('PORT', 5000))
+    
     logger.info("\n" + "="*70)
     logger.info("  WATER CONSUMPTION FORECASTING API SERVER")
     logger.info("="*70)
-    logger.info(f"Starting API server on http://localhost:5000")
-    logger.info("Dashboard available at http://localhost:5000/")
+    logger.info(f"Starting API server on port {port}")
+    logger.info(f"Environment: {'Railway' if os.getenv('RAILWAY_ENVIRONMENT') else 'Local'}")
     logger.info("="*70 + "\n")
     
-    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
+    # Railway deployment: bind to 0.0.0.0 and use environment PORT
+    app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
