@@ -1561,10 +1561,23 @@
     </div>
 
     <script>
-        // API Configuration
-        const API_URL = `http://${window.location.hostname}:5000/api`;
-        console.log('API URL:', API_URL);
-        console.log('Hostname:', window.location.hostname);
+// ============================================================
+// RAILWAY DEPLOYMENT FIX - Dynamic API URL Detection
+// ============================================================
+
+let API_URL;
+
+if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+    // Local development
+    API_URL = 'http://localhost:5000/api';
+} else {
+    // Production (Railway) - use same domain, no port
+    API_URL = `${window.location.protocol}//${window.location.host}/api`;
+}
+
+console.log('🚀 API URL configured:', API_URL);
+console.log('📍 Current host:', window.location.host);
+console.log('🌐 Protocol:', window.location.protocol);
         
         // Global variables
         let currentMunicipality = 'Tirupati';
@@ -2709,3 +2722,4 @@
     </script>
 </body>
 </html>
+
